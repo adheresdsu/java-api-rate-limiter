@@ -1,0 +1,10 @@
+.git
+target
+reports
+docs
+.github
+*.md
+.idea
+*.iml
+.vscode
+.DS_Store

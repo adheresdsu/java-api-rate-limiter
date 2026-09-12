@@ -20,7 +20,36 @@ load — many threads asking it at once, for many different clients, without
 serializing all of them behind a single lock — is the actual engineering
 problem this project explores.
 
-## Algorithms
+## Live request example
+
+Start the server (see [Running with Maven](#running-with-maven) or
+[Running the executable JAR](#running-the-executable-jar) below), then:
+
+```bash
+curl -i http://localhost:8080/health
+# HTTP/1.1 200 OK
+# Content-Type: application/json; charset=utf-8
+# {"status":"ok"}
+
+curl -i -H "X-Client-Id: alice" http://localhost:8080/api/resource
+# HTTP/1.1 200 OK
+# X-RateLimit-Limit: 20
+# X-RateLimit-Remaining: 19
+# {"message":"Access granted","clientId":"alice"}
+
+# Missing header
+curl -i http://localhost:8080/api/resource
+# HTTP/1.1 400 Bad Request
+# {"error":"Missing X-Client-Id header"}
+
+# Trigger a 429 by exceeding the configured limit
+for i in $(seq 1 30); do curl -s -o /dev/null -w "%{http_code}\n" \
+  -H "X-Client-Id: alice" http://localhost:8080/api/resource; done
+# ...200
+# 429
+```
+
+## Algorithms and tradeoffs
 
 Three independent, interchangeable implementations of the same
 `RateLimiter` interface:
@@ -64,12 +93,38 @@ until the window resets; sliding window log rounds up the time until the
 oldest in-window timestamp expires; token bucket rounds up the time needed to
 accumulate one more token at the configured refill rate.
 
-## HTTP server
+- **Fixed Window** is the simplest and cheapest, but permits a client to
+  briefly send up to twice its intended rate across a window boundary.
+- **Sliding Window Log** is precise — no boundary bursts — at the cost of
+  storing a timestamp per accepted request per client.
+- **Token Bucket** supports controlled bursts up to its capacity while
+  still capping sustained throughput at the refill rate.
+
+## Architecture
 
 A minimal HTTP server, built on the JDK's own `com.sun.net.httpserver.HttpServer`
-(no Spring Boot, no external web framework), exposes the rate limiter over
-two endpoints. The HTTP layer (`http` package) only translates requests to
+(no Spring Boot, no external web framework), sits in front of a pluggable
+`RateLimiter`. The HTTP layer (`http` package) only translates requests to
 and from `RateLimiter` calls — it does not duplicate any algorithm logic.
+
+```mermaid
+flowchart LR
+    Client["Client requests"] --> Handlers["HTTP handlers\n(/health, /api/resource)"]
+    Handlers --> Iface["RateLimiter interface\n.decide(clientId)"]
+    Iface --> FW["Fixed Window"]
+    Iface --> SW["Sliding Window Log"]
+    Iface --> TB["Token Bucket"]
+    FW --> Decision["RateLimitDecision\n(allowed, limit, remaining, retryAfter)"]
+    SW --> Decision
+    TB --> Decision
+    Decision --> Response["HTTP response\n(200 / 400 / 429 / 405)"]
+```
+
+Only one algorithm is active per running server instance, selected at
+startup by `--algorithm`; the diagram shows all three because they are
+interchangeable implementations of the same interface, not a chain. See
+[docs/DESIGN.md](docs/DESIGN.md) for the full technical design, including
+thread-safety strategy, request lifecycle, and benchmark methodology.
 
 ### `GET /health`
 
@@ -96,22 +151,10 @@ The protected demonstration endpoint. Requires an `X-Client-Id` header
 | Method other than `GET` | `405` | `Allow: GET` header set |
 | Unexpected server error | `500` | generic body, no stack trace or internal detail |
 
-All responses use `Content-Type: application/json; charset=utf-8`.
-
-### curl examples
-
-```bash
-curl -i http://localhost:8080/health
-
-curl -i -H "X-Client-Id: alice" http://localhost:8080/api/resource
-
-# Missing header
-curl -i http://localhost:8080/api/resource
-
-# Trigger a 429 by exceeding the configured limit
-for i in $(seq 1 30); do curl -s -o /dev/null -w "%{http_code}\n" \
-  -H "X-Client-Id: alice" http://localhost:8080/api/resource; done
-```
+All responses use `Content-Type: application/json; charset=utf-8`. The
+`X-Client-Id` value is treated as untrusted input: it is never interpolated
+into a query, file path, or shell command, and is JSON-escaped
+(`JsonSupport.escape`) before being reflected back in a response body.
 
 ## Configuration
 
@@ -130,17 +173,27 @@ instead of being silently ignored.
 | `--refill-period-seconds` | `1` | token-bucket |
 | `--workers` | `16` | all (HTTP server thread pool size) |
 
-## Starting and stopping the server
+## Running with Maven
+
+Requires Java 21 and Maven.
 
 ```bash
 mvn exec:java -Dexec.args="--algorithm token-bucket --port 8080"
 ```
 
-or, after `mvn package`, as a runnable jar:
+## Running the executable JAR
 
 ```bash
-java -jar target/gatekeeper-0.1.0-SNAPSHOT.jar --algorithm token-bucket --port 8080
+mvn clean package
+java -jar target/gatekeeper-0.1.0-SNAPSHOT.jar \
+  --algorithm token-bucket --port 8080 \
+  --capacity 10 --refill-tokens 2 --refill-period-seconds 1
 ```
+
+`mvn package` produces a directly runnable JAR — no separate "fat jar"
+plugin is needed because the runtime has zero third-party dependencies
+(only the JDK). The `maven-jar-plugin` simply stamps the manifest's
+`Main-Class` with `com.aryandhere.ratelimiter.GatekeeperApplication`.
 
 The server prints its listening address and active configuration on
 startup. Stop it with `Ctrl+C`; a shutdown hook stops accepting new
@@ -152,9 +205,9 @@ the worker thread pool.
 A concurrent HTTP load generator (`simulation` package) drives the running
 Gatekeeper server with `GET /api/resource` requests from deterministic
 simulated clients (`sim-client-1`, `sim-client-2`, ...). It is a local
-testing tool, not a general-purpose load tester: by default — and
-currently without any override — it refuses any `--base-url` that isn't
-`localhost`, `127.0.0.1`, or `::1`.
+testing tool, not a general-purpose load tester: it refuses any
+`--base-url` that isn't `localhost`, `127.0.0.1`, or `::1`, and there is no
+flag or override to target a remote host.
 
 Start a server, then in another terminal:
 
@@ -201,10 +254,7 @@ recommended production setting.
 
 Results are written to `reports/benchmarks/` as timestamped CSV (machine-readable)
 and Markdown (human-readable) files — a new file each run, never overwriting
-a previous one. **Throughput** is operations per second during the measured
-phase; **p50/p95/p99** are the 50th/95th/99th percentile latencies of
-individual `decide()` calls (nearest-rank method, documented in
-`LatencyStats`), converted from nanoseconds to milliseconds for display.
+a previous one.
 
 ### Measured results (this machine, this run)
 
@@ -219,7 +269,14 @@ median across trials):
 | Sliding Window Log | 1,651,840 | 0.000 | 0.000 | 0.000 |
 | Token Bucket | 1,861,555 | 0.000 | 0.000 | 0.000 |
 
-At this scale, a single in-memory `decide()` call is sub-microsecond, so
+These figures are copied from the linked committed report and must stay
+consistent with it; if the benchmark is re-run, regenerate a new timestamped
+report rather than hand-editing these numbers.
+
+**p50, p95, and p99** are the 50th, 95th, and 99th percentile latencies of
+individual `decide()` calls (nearest-rank method, documented in
+`LatencyStats`), converted from nanoseconds to milliseconds for display. At
+this scale, a single in-memory `decide()` call is sub-microsecond, so
 p50/p95/p99 round to `0.000` ms at the 3-decimal-place precision the
 benchmark displays — that is the honest result, not a rounding bug; see the
 full report for millisecond-scale `max` values and per-trial detail. These
@@ -236,27 +293,59 @@ direct benchmark measures only the algorithm call. Expect the simulator's
 latencies to be dominated by HTTP/OS overhead, not by which algorithm is
 selected — the direct benchmark above is what isolates algorithm cost.
 
-### Practical tradeoffs
+## Testing
 
-- **Fixed Window** is the simplest and cheapest, but permits a client to
-  briefly send up to twice its intended rate across a window boundary.
-- **Sliding Window Log** is precise — no boundary bursts — at the cost of
-  storing a timestamp per accepted request per client.
-- **Token Bucket** supports controlled bursts up to its capacity while
-  still capping sustained throughput at the refill rate.
+```bash
+mvn test    # run the full test suite
+```
 
-## Milestone status
+Unit tests cover each algorithm's boundary and concurrency behavior (using
+a manually-advanced `TimeSource` test double, not `Thread.sleep`), CLI
+argument parsing, JSON escaping, and benchmark/report-writer logic.
+Integration tests start a real `GatekeeperHttpServer` on an ephemeral port
+and drive it with real HTTP requests end to end.
 
-**Milestone 3 (current): traffic simulator and algorithm benchmarks.**
-This milestone adds the `simulation`, `benchmark`, and `stats` packages, and
-the `reports/benchmarks/` directory of generated reports. It does **not**
-include a frontend, Docker, distributed rate limiting, or a database —
-those remain out of scope.
+## Docker
 
-Nothing here has been evaluated for production security hardening,
-distributed deployment, or scalability beyond a single process. Benchmark
-numbers reflect one machine and one run each; see each report's own
-Limitations section.
+A multi-stage `Dockerfile` builds the JAR in a JDK image and runs it in a
+lightweight JRE image as a non-root user, exposing port 8080:
+
+```bash
+docker build -t gatekeeper .
+docker run --rm -p 8080:8080 gatekeeper \
+  --algorithm token-bucket --port 8080 --capacity 10 --refill-tokens 2 --refill-period-seconds 1
+
+curl -i http://localhost:8080/health
+```
+
+The final image contains only the built JAR — no source code, Git history,
+Maven cache, or benchmark reports.
+
+## Limitations
+
+- This is a **single-process, in-memory** rate limiter: all state lives in
+  the JVM heap of one running instance.
+- Limits are **not shared** across multiple server instances — running two
+  instances behind a load balancer gives each instance its own independent
+  allowance per client, not a combined one.
+- State is **lost when the process restarts**; there is no persistence.
+- Benchmark numbers are **machine-specific** — see
+  [Measured results](#measured-results-this-machine-this-run) and the
+  linked report's own Limitations section.
+- The traffic simulator **intentionally refuses remote targets**; it can
+  only drive a Gatekeeper instance on `localhost`.
+- Nothing here has been evaluated for production security hardening,
+  distributed rate limiting, or scalability beyond a single process, and
+  the security/privacy checks performed on this repository are a
+  targeted pass, not a complete security audit.
+
+## Possible future work
+
+- A distributed backing store (e.g. Redis) so limits are shared across
+  multiple server instances — out of scope for this project by design.
+- Pluggable persistence so limiter state survives a restart.
+- Per-endpoint or per-route rate limit configuration instead of one
+  algorithm for the whole server.
 
 ## Project layout
 
@@ -279,15 +368,7 @@ src/test/java/com/aryandhere/ratelimiter/
   simulation/  Argument/URL validation, and ephemeral-server integration tests
   benchmark/   Argument parsing, median calculation, runner, and report-writer tests
 reports/benchmarks/  Generated CSV and Markdown benchmark reports (timestamped)
-```
-
-## Build and test
-
-Requires Java 21 and Maven.
-
-```bash
-mvn test    # run the full test suite
-mvn package # build the jar
+docs/DESIGN.md       Technical design document
 ```
 
 ## License
