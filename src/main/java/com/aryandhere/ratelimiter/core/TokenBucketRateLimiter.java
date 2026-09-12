@@ -36,10 +36,10 @@ public final class TokenBucketRateLimiter implements RateLimiter {
     }
 
     @Override
-    public boolean tryAcquire(String clientId) {
+    public RateLimitDecision decide(String clientId) {
         Validation.requireClientId(clientId);
         Bucket bucket = bucketsByClient.computeIfAbsent(clientId, id -> new Bucket(capacity, timeSource.currentTimeMillis()));
-        return bucket.tryConsume(timeSource.currentTimeMillis());
+        return bucket.decide(timeSource.currentTimeMillis());
     }
 
     /** Per-client mutable state, synchronized independently of every other client. */
@@ -52,13 +52,15 @@ public final class TokenBucketRateLimiter implements RateLimiter {
             this.lastRefillMillis = now;
         }
 
-        synchronized boolean tryConsume(long now) {
+        synchronized RateLimitDecision decide(long now) {
             refill(now);
             if (tokens >= 1.0) {
                 tokens -= 1.0;
-                return true;
+                return RateLimitDecision.allow((long) capacity, (long) Math.floor(tokens));
             }
-            return false;
+            double tokensNeeded = 1.0 - tokens;
+            double millisNeeded = (tokensNeeded / refillRatePerSecond) * 1000.0;
+            return RateLimitDecision.reject((long) capacity, RetryAfter.ceilSeconds((long) Math.ceil(millisNeeded)));
         }
 
         private void refill(long now) {

@@ -43,7 +43,7 @@ public final class SlidingWindowLogRateLimiter implements RateLimiter {
     }
 
     @Override
-    public boolean tryAcquire(String clientId) {
+    public RateLimitDecision decide(String clientId) {
         Validation.requireClientId(clientId);
         Deque<Long> log = logsByClient.computeIfAbsent(clientId, id -> new ArrayDeque<>());
         long now = timeSource.currentTimeMillis();
@@ -54,9 +54,11 @@ public final class SlidingWindowLogRateLimiter implements RateLimiter {
             }
             if (log.size() < maxRequests) {
                 log.addLast(now);
-                return true;
+                return RateLimitDecision.allow(maxRequests, maxRequests - log.size());
             }
-            return false;
+            long oldestTimestamp = log.peekFirst();
+            long retryAfterMillis = (oldestTimestamp + windowMillis) - now;
+            return RateLimitDecision.reject(maxRequests, RetryAfter.ceilSeconds(retryAfterMillis));
         }
     }
 }

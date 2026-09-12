@@ -40,10 +40,10 @@ public final class FixedWindowRateLimiter implements RateLimiter {
     }
 
     @Override
-    public boolean tryAcquire(String clientId) {
+    public RateLimitDecision decide(String clientId) {
         Validation.requireClientId(clientId);
         Window window = windowsByClient.computeIfAbsent(clientId, id -> new Window(timeSource.currentTimeMillis()));
-        return window.tryAcquire(timeSource.currentTimeMillis());
+        return window.decide(timeSource.currentTimeMillis());
     }
 
     /** Per-client mutable state, synchronized independently of every other client. */
@@ -56,16 +56,17 @@ public final class FixedWindowRateLimiter implements RateLimiter {
             this.count = 0;
         }
 
-        synchronized boolean tryAcquire(long now) {
+        synchronized RateLimitDecision decide(long now) {
             if (now - windowStart >= windowMillis) {
                 windowStart = now;
                 count = 0;
             }
             if (count < maxRequests) {
                 count++;
-                return true;
+                return RateLimitDecision.allow(maxRequests, maxRequests - count);
             }
-            return false;
+            long remainingWindowMillis = windowMillis - (now - windowStart);
+            return RateLimitDecision.reject(maxRequests, RetryAfter.ceilSeconds(remainingWindowMillis));
         }
     }
 }

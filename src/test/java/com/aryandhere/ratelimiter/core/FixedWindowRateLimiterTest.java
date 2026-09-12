@@ -2,6 +2,8 @@ package com.aryandhere.ratelimiter.core;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -67,6 +69,34 @@ class FixedWindowRateLimiterTest {
         assertTrue(limiter.tryAcquire("client-1"));
         assertFalse(limiter.tryAcquire("client-1"));
         assertTrue(limiter.tryAcquire("client-2"));
+    }
+
+    @Test
+    void decisionReportsRemainingAndNoRetryAfterWhenAllowed() {
+        ManualTimeSource clock = new ManualTimeSource(0);
+        FixedWindowRateLimiter limiter = new FixedWindowRateLimiter(3, Duration.ofSeconds(1), clock);
+
+        RateLimitDecision decision = limiter.decide("client-1");
+
+        assertTrue(decision.allowed());
+        assertEquals(3, decision.limit());
+        assertEquals(2, decision.remaining());
+        assertNull(decision.retryAfter());
+    }
+
+    @Test
+    void decisionReportsZeroRemainingAndRetryAfterWhenRejected() {
+        ManualTimeSource clock = new ManualTimeSource(0);
+        FixedWindowRateLimiter limiter = new FixedWindowRateLimiter(1, Duration.ofSeconds(4), clock);
+
+        limiter.decide("client-1");
+        RateLimitDecision decision = limiter.decide("client-1");
+
+        assertFalse(decision.allowed());
+        assertEquals(0, decision.remaining());
+        assertNotNull(decision.retryAfter());
+        assertTrue(decision.retryAfter().toMillis() > 0);
+        assertTrue(decision.retryAfter().toSeconds() <= 4);
     }
 
     @Test
